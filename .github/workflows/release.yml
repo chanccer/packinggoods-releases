@@ -1,0 +1,200 @@
+# Builds packinggoods from the private source repository on GitHub's own runners and publishes the files here, signed.
+# The source is read with a read-only deploy key (SOURCE_DEPLOY_KEY); the release is signed with UPDATE_SIGNING_KEY, whose
+# public half is built into the program (build/update-key.pub in the source). Nothing in this repository is built from
+# anything but GitHub-hosted runners: it is public, and a self-hosted runner on a public repository would run a stranger's code.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without v, for example 0.1.0"
+        required: true
+      ref:
+        description: "Branch, tag or commit of the source to build"
+        required: true
+        default: main
+      notes:
+        description: "Release notes (markdown)"
+        required: false
+        default: ""
+
+concurrency: release
+
+permissions:
+  contents: write
+
+env:
+  SOURCE: git@github.com:chanccer/packinggoods.git
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The version is a version, and is not released yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version $VERSION is not x.y.z"; exit 1 ;;
+          esac
+          case "$VERSION" in *[!0-9A-Za-z.+-]*) echo "::error::bad characters in version"; exit 1 ;; esac
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v$VERSION is already released: a release is never replaced"; exit 1
+          fi
+
+  cli-windows:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Source
+        env:
+          KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          REF: ${{ inputs.ref }}
+        run: |
+          umask 077; mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/source; echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git init -q src && cd src && git remote add origin "$SOURCE" && git fetch -q --depth 1 origin "$REF" && git checkout -q FETCH_HEAD
+          echo "source $(git rev-parse HEAD)"; rm -f ~/.ssh/source
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: Terminal builds, all platforms
+        working-directory: src
+        run: make VERSION="$VERSION" release-cli
+      - name: Windows app
+        working-directory: src
+        run: make VERSION="$VERSION" release-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-cli-windows
+          path: src/dist/*
+          if-no-files-found: error
+
+  linux:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Source
+        env:
+          KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          REF: ${{ inputs.ref }}
+        run: |
+          umask 077; mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/source; echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git init -q src && cd src && git remote add origin "$SOURCE" && git fetch -q --depth 1 origin "$REF" && git checkout -q FETCH_HEAD
+          echo "source $(git rev-parse HEAD)"; rm -f ~/.ssh/source
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: GTK and WebKitGTK
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
+      - name: Linux app
+        working-directory: src
+        run: make VERSION="$VERSION" release-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ runner.arch }}
+          path: src/dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Source
+        env:
+          KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          REF: ${{ inputs.ref }}
+        run: |
+          umask 077; mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/source; echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git init -q src && cd src && git remote add origin "$SOURCE" && git fetch -q --depth 1 origin "$REF" && git checkout -q FETCH_HEAD
+          echo "source $(git rev-parse HEAD)"; rm -f ~/.ssh/source
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: The app
+        working-directory: src
+        run: |
+          make VERSION="$VERSION" app
+          # a bundle's seal: ad hoc, since no Apple developer identity is set up. The updater compares signers, and two ad hoc
+          # builds have none to differ in; the signed SHA256SUMS is what a download is held to.
+          codesign --force --deep -s - packinggoods.app
+          codesign --verify --deep --strict packinggoods.app
+          mkdir -p dist
+          ditto -c -k --keepParent packinggoods.app "dist/packinggoods-darwin-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: src/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [cli-windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Source
+        env:
+          KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          REF: ${{ inputs.ref }}
+        run: |
+          umask 077; mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/source; echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git init -q src && cd src && git remote add origin "$SOURCE" && git fetch -q --depth 1 origin "$REF" && git checkout -q FETCH_HEAD
+          echo "source $(git rev-parse HEAD)"; rm -f ~/.ssh/source
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: parts
+          pattern: dist-*
+          merge-multiple: true
+      - name: Sum, sign, publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_SEED: ${{ secrets.UPDATE_SIGNING_KEY }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -e
+          cd parts
+          ls -l
+          # a file this release must have: the updater looks each one up by name
+          for f in packinggoods-darwin-arm64.zip packinggoods-darwin-amd64.zip packinggoods-windows-amd64.exe packinggoods-windows-arm64.exe \
+                   packinggoods-linux-amd64 packinggoods-linux-arm64 packinggoods-cli-darwin-arm64 packinggoods-cli-linux-amd64 packinggoods-cli-windows-amd64.exe; do
+            [ -s "$f" ] || { echo "::error::$f is missing"; exit 1; }
+          done
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          key=$(mktemp); trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SIGNING_SEED" > "$key"
+          (cd ../src && go run ./tools/signsums -key "$key" -version "$VERSION" -sums ../parts/SHA256SUMS) > SHA256SUMS.sig
+          (cd ../src && go run ./tools/signsums -key "$key" -pub) > pub.txt
+          # the public half signed with must be the one the source builds in
+          [ "$(cat pub.txt)" = "$(tr -d '[:space:]' < ../src/build/update-key.pub)" ] || { echo "::error::the signing key is not the one built in"; exit 1; }
+          rm -f pub.txt
+          printf '%s\n' "${NOTES:-packinggoods $VERSION}" > ../notes.md
+          gh release create "v$VERSION" * --repo "$GITHUB_REPOSITORY" --title "packinggoods $VERSION" --notes-file ../notes.md --latest
